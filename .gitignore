@@ -143,7 +143,9 @@ output/
 processed/
 temp/
 tmp/
+audio_processor_config.json
 
 # Personal
 .claude/
 .ignore/
+*.bat
