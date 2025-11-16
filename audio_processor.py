@@ -6,9 +6,6 @@ import tempfile
 import logging
 from typing import List, Optional
 import ffmpeg
-import numpy as np
-import librosa
-import soundfile as sf
 from pydub import AudioSegment
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -287,29 +284,18 @@ class AudioProcessor(QThread):
                         audio = AudioSegment.from_wav(temp_norm_path)
 
                         if is_slow:
-                            # Create slowed version
-                            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_slow:
-                                temp_slow_path = temp_slow.name
-
-                            y, sr = librosa.load(temp_norm_path, sr=None, mono=False)
-                            if y.ndim == 1:
-                                y_stretched = librosa.effects.time_stretch(y, rate=0.6)
-                            else:
-                                y_stretched = np.array([
-                                    librosa.effects.time_stretch(y[0], rate=0.6),
-                                    librosa.effects.time_stretch(y[1], rate=0.6)
-                                ])
-
-                            if y_stretched.ndim == 1:
-                                sf.write(temp_slow_path, y_stretched, sr)
-                            else:
-                                sf.write(temp_slow_path, y_stretched.T, sr)
-
-                            slow_audio = AudioSegment.from_wav(temp_slow_path)
-                            slow_audio.export(output_path, format='mp3')
-
-                            if os.path.exists(temp_slow_path):
-                                os.unlink(temp_slow_path)
+                            # Create slowed version - use FFmpeg directly to avoid WAV size limitations
+                            stream = ffmpeg.input(temp_norm_path)
+                            stream = ffmpeg.output(
+                                stream,
+                                output_path,
+                                af='atempo=0.6',
+                                acodec='libmp3lame',
+                                ar=44100,
+                                ab='320k',
+                                loglevel='info'
+                            )
+                            ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, overwrite_output=True)
                         else:
                             # Export normal speed
                             audio.export(output_path, format='mp3')
@@ -337,33 +323,24 @@ class AudioProcessor(QThread):
                         logging.debug(f"Peak normalization: adjusted from {peak_dbfs:.2f} dBFS to {target_peak_dbfs:.2f} dBFS")
 
                         if is_slow:
-                            # Create slowed version
+                            # Create slowed version - export peak normalized audio to temp WAV, then use FFmpeg
                             with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_norm:
                                 temp_norm_path = temp_norm.name
                             audio.export(temp_norm_path, format='wav')
 
-                            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_slow:
-                                temp_slow_path = temp_slow.name
+                            # Use FFmpeg to apply tempo change directly to MP3 to avoid WAV size limitations
+                            stream = ffmpeg.input(temp_norm_path)
+                            stream = ffmpeg.output(
+                                stream,
+                                output_path,
+                                af='atempo=0.6',
+                                acodec='libmp3lame',
+                                ar=44100,
+                                ab='320k',
+                                loglevel='info'
+                            )
+                            ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, overwrite_output=True)
 
-                            y, sr = librosa.load(temp_norm_path, sr=None, mono=False)
-                            if y.ndim == 1:
-                                y_stretched = librosa.effects.time_stretch(y, rate=0.6)
-                            else:
-                                y_stretched = np.array([
-                                    librosa.effects.time_stretch(y[0], rate=0.6),
-                                    librosa.effects.time_stretch(y[1], rate=0.6)
-                                ])
-
-                            if y_stretched.ndim == 1:
-                                sf.write(temp_slow_path, y_stretched, sr)
-                            else:
-                                sf.write(temp_slow_path, y_stretched.T, sr)
-
-                            slow_audio = AudioSegment.from_wav(temp_slow_path)
-                            slow_audio.export(output_path, format='mp3')
-
-                            if os.path.exists(temp_slow_path):
-                                os.unlink(temp_slow_path)
                             if os.path.exists(temp_norm_path):
                                 os.unlink(temp_norm_path)
                         else:
@@ -380,29 +357,18 @@ class AudioProcessor(QThread):
                     logging.info(f"Creating {os.path.basename(output_path)} without normalization...")
                     try:
                         if is_slow:
-                            # Create slowed version from original WAV
-                            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_slow:
-                                temp_slow_path = temp_slow.name
-
-                            y, sr = librosa.load(temp_wav_path, sr=None, mono=False)
-                            if y.ndim == 1:
-                                y_stretched = librosa.effects.time_stretch(y, rate=0.6)
-                            else:
-                                y_stretched = np.array([
-                                    librosa.effects.time_stretch(y[0], rate=0.6),
-                                    librosa.effects.time_stretch(y[1], rate=0.6)
-                                ])
-
-                            if y_stretched.ndim == 1:
-                                sf.write(temp_slow_path, y_stretched, sr)
-                            else:
-                                sf.write(temp_slow_path, y_stretched.T, sr)
-
-                            slow_audio = AudioSegment.from_wav(temp_slow_path)
-                            slow_audio.export(output_path, format='mp3')
-
-                            if os.path.exists(temp_slow_path):
-                                os.unlink(temp_slow_path)
+                            # Create slowed version - use FFmpeg directly to avoid WAV size limitations
+                            stream = ffmpeg.input(temp_wav_path)
+                            stream = ffmpeg.output(
+                                stream,
+                                output_path,
+                                af='atempo=0.6',
+                                acodec='libmp3lame',
+                                ar=44100,
+                                ab='320k',
+                                loglevel='info'
+                            )
+                            ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, overwrite_output=True)
                         else:
                             # Export normal speed from original WAV
                             audio = AudioSegment.from_wav(temp_wav_path)
