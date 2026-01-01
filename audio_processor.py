@@ -53,7 +53,8 @@ def load_config():
     default_config = {
         "output_dir": "",
         "slow_audio": True,
-        "normalization_methods": []  # List of enabled methods: "peak", "dynamic", "speech"
+        "normalization_methods": [],  # List of enabled methods: "peak", "dynamic", "speech"
+        "output_format": "mp3"  # "mp3" or "m4a"
     }
     if os.path.exists(CONFIG_FILE):
         try:
@@ -92,14 +93,15 @@ class AudioProcessor(QThread):
     processing_complete = pyqtSignal()
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, input_files: List[str], output_dir: str, slow_down: bool, normalization_methods: List[str]):
+    def __init__(self, input_files: List[str], output_dir: str, slow_down: bool, normalization_methods: List[str], output_format: str = "mp3"):
         super().__init__()
         self.input_files = input_files
         self.output_dir = output_dir
         self.slow_down = slow_down
         self.normalization_methods = normalization_methods  # List of methods to apply
+        self.output_format = output_format  # "mp3" or "m4a"
         self.is_running = True
-        logging.debug(f"AudioProcessor initialized with {len(input_files)} files, slow_down={slow_down}, normalization_methods={normalization_methods}")
+        logging.debug(f"AudioProcessor initialized with {len(input_files)} files, slow_down={slow_down}, normalization_methods={normalization_methods}, output_format={output_format}")
 
     def run(self):
         logging.debug("AudioProcessor run method started")
@@ -127,6 +129,7 @@ class AudioProcessor(QThread):
 
     def process_file(self, input_file: str, current_file: int, total_files: int):
         base_name = os.path.splitext(os.path.basename(input_file))[0]
+        ext = self.output_format  # "mp3" or "m4a"
 
         logging.info(f"Processing file {current_file}/{total_files}: {base_name}")
 
@@ -136,13 +139,13 @@ class AudioProcessor(QThread):
         if not self.normalization_methods:
             # No normalization - output un-normalized version(s)
             output_files.append({
-                'path': os.path.join(self.output_dir, f"{base_name}.mp3"),
+                'path': os.path.join(self.output_dir, f"{base_name}.{ext}"),
                 'method': None,
                 'slow': False
             })
             if self.slow_down:
                 output_files.append({
-                    'path': os.path.join(self.output_dir, f"{base_name}_sl0w.mp3"),
+                    'path': os.path.join(self.output_dir, f"{base_name}_sl0w.{ext}"),
                     'method': None,
                     'slow': True
                 })
@@ -154,7 +157,7 @@ class AudioProcessor(QThread):
 
                 # Normal speed version
                 output_files.append({
-                    'path': os.path.join(self.output_dir, f"{base_name}{suffix}.mp3"),
+                    'path': os.path.join(self.output_dir, f"{base_name}{suffix}.{ext}"),
                     'method': method,
                     'slow': False
                 })
@@ -162,7 +165,7 @@ class AudioProcessor(QThread):
                 # Slow version if enabled
                 if self.slow_down:
                     output_files.append({
-                        'path': os.path.join(self.output_dir, f"{base_name}{suffix}_sl0w.mp3"),
+                        'path': os.path.join(self.output_dir, f"{base_name}{suffix}_sl0w.{ext}"),
                         'method': method,
                         'slow': True
                     })
@@ -170,6 +173,16 @@ class AudioProcessor(QThread):
         # Calculate progress steps
         total_steps = len(output_files) + 1  # +1 for initial extraction
         current_step = 0
+
+        # Determine codec settings based on output format
+        if self.output_format == "m4a":
+            audio_codec = 'aac'
+            audio_bitrate = '256k'
+            pydub_format = 'ipod'  # pydub uses 'ipod' for m4a/aac
+        else:
+            audio_codec = 'libmp3lame'
+            audio_bitrate = '320k'
+            pydub_format = 'mp3'
 
         def update_progress(step_description: str):
             nonlocal current_step
@@ -242,9 +255,9 @@ class AudioProcessor(QThread):
                                 stream,
                                 output_path,
                                 af='loudnorm,speechnorm,loudnorm,atempo=0.6',
-                                acodec='libmp3lame',
+                                acodec=audio_codec,
                                 ar=44100,
-                                ab='320k',
+                                ab=audio_bitrate,
                                 loglevel='info'
                             )
                         else:
@@ -253,9 +266,9 @@ class AudioProcessor(QThread):
                                 stream,
                                 output_path,
                                 af='loudnorm,speechnorm,loudnorm',
-                                acodec='libmp3lame',
+                                acodec=audio_codec,
                                 ar=44100,
-                                ab='320k',
+                                ab=audio_bitrate,
                                 loglevel='info'
                             )
 
@@ -290,15 +303,15 @@ class AudioProcessor(QThread):
                                 stream,
                                 output_path,
                                 af='atempo=0.6',
-                                acodec='libmp3lame',
+                                acodec=audio_codec,
                                 ar=44100,
-                                ab='320k',
+                                ab=audio_bitrate,
                                 loglevel='info'
                             )
                             ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, overwrite_output=True)
                         else:
                             # Export normal speed
-                            audio.export(output_path, format='mp3')
+                            audio.export(output_path, format=pydub_format)
 
                         if os.path.exists(temp_norm_path):
                             os.unlink(temp_norm_path)
@@ -328,15 +341,15 @@ class AudioProcessor(QThread):
                                 temp_norm_path = temp_norm.name
                             audio.export(temp_norm_path, format='wav')
 
-                            # Use FFmpeg to apply tempo change directly to MP3 to avoid WAV size limitations
+                            # Use FFmpeg to apply tempo change directly to output format to avoid WAV size limitations
                             stream = ffmpeg.input(temp_norm_path)
                             stream = ffmpeg.output(
                                 stream,
                                 output_path,
                                 af='atempo=0.6',
-                                acodec='libmp3lame',
+                                acodec=audio_codec,
                                 ar=44100,
-                                ab='320k',
+                                ab=audio_bitrate,
                                 loglevel='info'
                             )
                             ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, overwrite_output=True)
@@ -345,7 +358,7 @@ class AudioProcessor(QThread):
                                 os.unlink(temp_norm_path)
                         else:
                             # Export normal speed
-                            audio.export(output_path, format='mp3')
+                            audio.export(output_path, format=pydub_format)
 
                         logging.info(f"Successfully created: {output_path}")
 
@@ -353,7 +366,7 @@ class AudioProcessor(QThread):
                         raise Exception(f"Failed to create {os.path.basename(output_path)}: {str(e)}")
 
                 else:
-                    # No normalization - just convert to MP3
+                    # No normalization - just convert to output format
                     logging.info(f"Creating {os.path.basename(output_path)} without normalization...")
                     try:
                         if is_slow:
@@ -363,16 +376,16 @@ class AudioProcessor(QThread):
                                 stream,
                                 output_path,
                                 af='atempo=0.6',
-                                acodec='libmp3lame',
+                                acodec=audio_codec,
                                 ar=44100,
-                                ab='320k',
+                                ab=audio_bitrate,
                                 loglevel='info'
                             )
                             ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, overwrite_output=True)
                         else:
                             # Export normal speed from original WAV
                             audio = AudioSegment.from_wav(temp_wav_path)
-                            audio.export(output_path, format='mp3')
+                            audio.export(output_path, format=pydub_format)
 
                         logging.info(f"Successfully created: {output_path}")
 
@@ -510,6 +523,9 @@ class MainWindow(QMainWindow):
 
         norm_group.setLayout(norm_layout)
 
+        # Horizontal layout for Slow Audio and Output Format options
+        tempo_format_layout = QHBoxLayout()
+
         # Tempo options
         tempo_group = QGroupBox("Slow Audio (60%)")
         tempo_layout = QVBoxLayout()
@@ -521,8 +537,22 @@ class MainWindow(QMainWindow):
         tempo_layout.addWidget(self.tempo_off)
         tempo_group.setLayout(tempo_layout)
 
+        # Output format options
+        format_group = QGroupBox("Output Format")
+        format_layout = QVBoxLayout()
+        self.format_mp3 = QRadioButton("MP3")
+        self.format_m4a = QRadioButton("M4A (AAC)")
+        self.format_mp3.setChecked(self.config.get("output_format", "mp3") == "mp3")
+        self.format_m4a.setChecked(self.config.get("output_format", "mp3") == "m4a")
+        format_layout.addWidget(self.format_mp3)
+        format_layout.addWidget(self.format_m4a)
+        format_group.setLayout(format_layout)
+
+        tempo_format_layout.addWidget(tempo_group)
+        tempo_format_layout.addWidget(format_group)
+
         options_layout.addWidget(norm_group)
-        options_layout.addWidget(tempo_group)
+        options_layout.addLayout(tempo_format_layout)
         layout.addLayout(options_layout)
 
         # Progress bar
@@ -549,14 +579,21 @@ class MainWindow(QMainWindow):
         self.tempo_group.addButton(self.tempo_on)
         self.tempo_group.addButton(self.tempo_off)
 
+        # Create button group for format radio buttons
+        self.format_group = QButtonGroup()
+        self.format_group.addButton(self.format_mp3)
+        self.format_group.addButton(self.format_m4a)
+
         # Connect signals
         self.tempo_on.toggled.connect(self.save_options)
+        self.format_mp3.toggled.connect(self.save_options)
         self.norm_peak.toggled.connect(self.save_options)
         self.norm_dynamic.toggled.connect(self.save_options)
         self.norm_speech.toggled.connect(self.save_options)
 
     def save_options(self):
         self.config["slow_audio"] = self.tempo_on.isChecked()
+        self.config["output_format"] = "mp3" if self.format_mp3.isChecked() else "m4a"
 
         # Collect all checked normalization methods
         methods = []
@@ -634,8 +671,10 @@ class MainWindow(QMainWindow):
         if self.norm_speech.isChecked():
             normalization_methods.append("speech")
 
+        output_format = "mp3" if self.format_mp3.isChecked() else "m4a"
         logger.info(f"Normalization methods: {normalization_methods if normalization_methods else 'None'}")
         logger.info(f"Slow audio: {'ON' if self.tempo_on.isChecked() else 'OFF'}")
+        logger.info(f"Output format: {output_format.upper()}")
 
         if self.processor and self.processor.isRunning():
             logger.info("Stopping current processing...")
@@ -651,7 +690,8 @@ class MainWindow(QMainWindow):
                 files,
                 self.config["output_dir"],
                 self.tempo_on.isChecked(),
-                normalization_methods
+                normalization_methods,
+                output_format
             )
             self.processor.progress_updated.connect(self.update_progress)
             self.processor.processing_complete.connect(self.processing_finished)
@@ -671,6 +711,8 @@ class MainWindow(QMainWindow):
         self.norm_speech.setEnabled(enabled)
         self.tempo_on.setEnabled(enabled)
         self.tempo_off.setEnabled(enabled)
+        self.format_mp3.setEnabled(enabled)
+        self.format_m4a.setEnabled(enabled)
 
     def update_progress(self, value: int, message: str):
         self.progress_bar.setValue(value)
