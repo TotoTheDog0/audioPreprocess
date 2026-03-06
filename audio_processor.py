@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 import tempfile
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional
 import ffmpeg
 from pydub import AudioSegment
@@ -194,8 +196,6 @@ class AudioProcessor(QThread):
             )
 
         temp_wav_path = None
-        temp_norm_path = None
-        temp_slow_path = None
 
         try:
             # Create temporary WAV file
@@ -219,10 +219,10 @@ class AudioProcessor(QThread):
                 logging.debug(f"Starting FFmpeg extraction to {temp_wav_path}")
                 stream = ffmpeg.input(input_file)
                 stream = ffmpeg.output(stream, temp_wav_path, acodec='pcm_s16le', ac=2, loglevel='info')
-                
+
                 cmd = ffmpeg.compile(stream, overwrite_output=True)
                 logging.debug(f"FFmpeg command: {' '.join(cmd)}")
-                
+
                 out, err = ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, overwrite_output=True)
                 logging.debug("FFmpeg extraction completed successfully")
                 if err:
@@ -234,47 +234,28 @@ class AudioProcessor(QThread):
                 logging.error(error_msg)
                 raise Exception(f"Failed to extract audio: {str(e)}")
 
-            # Process each output file
-            for output_info in output_files:
+            # Process output variants in parallel
+            progress_lock = threading.Lock()
+
+            def process_variant(output_info):
                 output_path = output_info['path']
                 method = output_info['method']
                 is_slow = output_info['slow']
 
-                desc = f"Creating {os.path.basename(output_path)}"
-                update_progress(desc)
+                with progress_lock:
+                    update_progress(f"Creating {os.path.basename(output_path)}")
 
                 if method == "speech":
-                    # Speech normalization: use FFmpeg directly to avoid WAV size limitations
                     logging.info(f"Creating {os.path.basename(output_path)} with speech normalization...")
                     try:
                         stream = ffmpeg.input(temp_wav_path)
-
-                        if is_slow:
-                            # Apply both speech normalization and tempo change
-                            stream = ffmpeg.output(
-                                stream,
-                                output_path,
-                                af='loudnorm,speechnorm,loudnorm,atempo=0.6',
-                                acodec=audio_codec,
-                                ar=44100,
-                                ab=audio_bitrate,
-                                loglevel='info'
-                            )
-                        else:
-                            # Apply only speech normalization
-                            stream = ffmpeg.output(
-                                stream,
-                                output_path,
-                                af='loudnorm,speechnorm,loudnorm',
-                                acodec=audio_codec,
-                                ar=44100,
-                                ab=audio_bitrate,
-                                loglevel='info'
-                            )
-
+                        af = 'loudnorm,speechnorm,loudnorm,atempo=0.6' if is_slow else 'loudnorm,speechnorm,loudnorm'
+                        stream = ffmpeg.output(
+                            stream, output_path,
+                            af=af, acodec=audio_codec, ar=44100, ab=audio_bitrate, loglevel='info'
+                        )
                         ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, overwrite_output=True)
                         logging.info(f"Successfully created: {output_path}")
-
                     except ffmpeg.Error as e:
                         error_msg = "FFmpeg speech normalization failed"
                         if e.stderr:
@@ -283,52 +264,38 @@ class AudioProcessor(QThread):
                         raise Exception(f"Failed to create {os.path.basename(output_path)}: {str(e)}")
 
                 elif method == "dynamic":
-                    # Dynamic normalization: use FFmpeg dynaudnorm
                     logging.info(f"Creating {os.path.basename(output_path)} with dynamic normalization...")
+                    local_norm_path = None
                     try:
-                        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_norm:
-                            temp_norm_path = temp_norm.name
-
+                        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+                            local_norm_path = tmp.name
                         stream = ffmpeg.input(temp_wav_path)
-                        stream = ffmpeg.output(stream, temp_norm_path, af='dynaudnorm', loglevel='info')
+                        stream = ffmpeg.output(stream, local_norm_path, af='dynaudnorm', loglevel='info')
                         ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, overwrite_output=True)
 
-                        # Load normalized audio and export
-                        audio = AudioSegment.from_wav(temp_norm_path)
-
                         if is_slow:
-                            # Create slowed version - use FFmpeg directly to avoid WAV size limitations
-                            stream = ffmpeg.input(temp_norm_path)
+                            stream = ffmpeg.input(local_norm_path)
                             stream = ffmpeg.output(
-                                stream,
-                                output_path,
-                                af='atempo=0.6',
-                                acodec=audio_codec,
-                                ar=44100,
-                                ab=audio_bitrate,
-                                loglevel='info'
+                                stream, output_path,
+                                af='atempo=0.6', acodec=audio_codec, ar=44100, ab=audio_bitrate, loglevel='info'
                             )
                             ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, overwrite_output=True)
                         else:
-                            # Export normal speed
+                            audio = AudioSegment.from_wav(local_norm_path)
                             audio.export(output_path, format=pydub_format)
 
-                        if os.path.exists(temp_norm_path):
-                            os.unlink(temp_norm_path)
-
                         logging.info(f"Successfully created: {output_path}")
-
                     except Exception as e:
                         raise Exception(f"Failed to create {os.path.basename(output_path)}: {str(e)}")
+                    finally:
+                        if local_norm_path and os.path.exists(local_norm_path):
+                            os.unlink(local_norm_path)
 
                 elif method == "peak":
-                    # Peak normalization: use pydub
                     logging.info(f"Creating {os.path.basename(output_path)} with peak normalization...")
+                    local_norm_path = None
                     try:
-                        # Load audio from original WAV
                         audio = AudioSegment.from_wav(temp_wav_path)
-
-                        # Apply peak normalization
                         peak_dbfs = audio.max_dBFS
                         target_peak_dbfs = -1.0
                         change_in_dbfs = target_peak_dbfs - peak_dbfs
@@ -336,61 +303,46 @@ class AudioProcessor(QThread):
                         logging.debug(f"Peak normalization: adjusted from {peak_dbfs:.2f} dBFS to {target_peak_dbfs:.2f} dBFS")
 
                         if is_slow:
-                            # Create slowed version - export peak normalized audio to temp WAV, then use FFmpeg
-                            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_norm:
-                                temp_norm_path = temp_norm.name
-                            audio.export(temp_norm_path, format='wav')
-
-                            # Use FFmpeg to apply tempo change directly to output format to avoid WAV size limitations
-                            stream = ffmpeg.input(temp_norm_path)
+                            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+                                local_norm_path = tmp.name
+                            audio.export(local_norm_path, format='wav')
+                            stream = ffmpeg.input(local_norm_path)
                             stream = ffmpeg.output(
-                                stream,
-                                output_path,
-                                af='atempo=0.6',
-                                acodec=audio_codec,
-                                ar=44100,
-                                ab=audio_bitrate,
-                                loglevel='info'
+                                stream, output_path,
+                                af='atempo=0.6', acodec=audio_codec, ar=44100, ab=audio_bitrate, loglevel='info'
                             )
                             ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, overwrite_output=True)
-
-                            if os.path.exists(temp_norm_path):
-                                os.unlink(temp_norm_path)
                         else:
-                            # Export normal speed
                             audio.export(output_path, format=pydub_format)
 
                         logging.info(f"Successfully created: {output_path}")
-
                     except Exception as e:
                         raise Exception(f"Failed to create {os.path.basename(output_path)}: {str(e)}")
+                    finally:
+                        if local_norm_path and os.path.exists(local_norm_path):
+                            os.unlink(local_norm_path)
 
                 else:
-                    # No normalization - just convert to output format
                     logging.info(f"Creating {os.path.basename(output_path)} without normalization...")
                     try:
                         if is_slow:
-                            # Create slowed version - use FFmpeg directly to avoid WAV size limitations
                             stream = ffmpeg.input(temp_wav_path)
                             stream = ffmpeg.output(
-                                stream,
-                                output_path,
-                                af='atempo=0.6',
-                                acodec=audio_codec,
-                                ar=44100,
-                                ab=audio_bitrate,
-                                loglevel='info'
+                                stream, output_path,
+                                af='atempo=0.6', acodec=audio_codec, ar=44100, ab=audio_bitrate, loglevel='info'
                             )
                             ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, overwrite_output=True)
                         else:
-                            # Export normal speed from original WAV
                             audio = AudioSegment.from_wav(temp_wav_path)
                             audio.export(output_path, format=pydub_format)
-
                         logging.info(f"Successfully created: {output_path}")
-
                     except Exception as e:
                         raise Exception(f"Failed to create {os.path.basename(output_path)}: {str(e)}")
+
+            with ThreadPoolExecutor(max_workers=len(output_files)) as executor:
+                futures = {executor.submit(process_variant, info): info for info in output_files}
+                for future in as_completed(futures):
+                    future.result()  # re-raises any exception from the variant
 
             logging.info(f"Successfully processed: {base_name}")
             self.progress_updated.emit(
@@ -405,19 +357,14 @@ class AudioProcessor(QThread):
             raise e
 
         finally:
-            # Clean up temporary files
+            # Clean up temporary WAV file
             logging.debug("Cleaning up temporary files")
-            for temp_file, file_type in [
-                (temp_wav_path, "WAV"),
-                (temp_norm_path, "normalized"),
-                (temp_slow_path, "slowed")
-            ]:
-                try:
-                    if temp_file and os.path.exists(temp_file):
-                        os.unlink(temp_file)
-                        logging.debug(f"Removed temporary {file_type} file: {temp_file}")
-                except Exception as e:
-                    logging.warning(f"Failed to remove temporary {file_type} file: {str(e)}")
+            try:
+                if temp_wav_path and os.path.exists(temp_wav_path):
+                    os.unlink(temp_wav_path)
+                    logging.debug(f"Removed temporary WAV file: {temp_wav_path}")
+            except Exception as e:
+                logging.warning(f"Failed to remove temporary WAV file: {str(e)}")
 
     def stop(self):
         self.is_running = False
